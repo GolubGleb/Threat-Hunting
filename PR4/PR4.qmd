@@ -1,0 +1,150 @@
+---
+title: "Анализ данных сетевого трафика с использованием аналитической in-memory СУБД DuckDB"
+author: "Тыван Максим"
+format:
+    md: 
+        output-file: README
+engine: knitr
+---
+
+# Цель работы
+
+1. Изучить возможности СУБД DuckDB для обработки и анализ больших данных
+2. Получить навыки применения DuckDB совместно с языком программирования R
+3. Получить навыки анализа метаинфомации о сетевом трафике
+4. Получить навыки применения облачных технологий хранения, подготовки и
+анализа данных: Yandex Object Storage, Rstudio Server.
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(duckdb)
+```
+```{r}
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+dbExecute(conn = con, "INSTALL httpfs; LOAD httpfs;")
+```
+```{r}
+PARQUET_FILE1 = "https://storage.yandexcloud.net/arrow-datasets/tm_data.pqt"
+
+
+sql <- "SELECT * FROM read_parquet([?])"
+df <- dbGetQuery(con, sql, list(PARQUET_FILE1))
+```
+
+## Задание 1
+
+Важнейшие документы с результатами нашей исследовательской деятельности в
+области создания вакцин скачиваются в виде больших заархивированных дампов.
+Один из хостов в нашей сети используется для пересылки этой информации – он
+пересылает гораздо больше информации на внешние ресурсы в Интернете, чем
+остальные компьютеры нашей сети. Определите его IP-адрес.
+
+```{r}
+leak <- df %>% select(src, bytes) %>% group_by(src) %>% summarise(bytsum = sum(bytes)) %>% arrange(desc(bytsum)) %>% head(1)
+
+leak %>% collect
+```
+
+Ответ: 13.37.84.125
+
+##Задание 2
+
+Другой атакующий установил автоматическую задачу в системном планировщике cron для экспорта содержимого внутренней wiki системы. Эта система генерирует большое количество трафика в нерабочие часы, больше чем остальные хосты. Определите IP этой системы. Известно, что ее IP адрес отличается от нарушителя из предыдущей задачи.
+
+Находим нерабочее время
+
+```{r}
+library(lubridate)
+time <- df %>% select(timestamp, src, bytes) %>% mutate(timestamp = hour(as_datetime(timestamp/1000))) %>% group_by(timestamp) %>% summarise(traffic_size = sum(bytes)) %>% arrange(desc(traffic_size))
+
+time %>% collect()
+```
+
+По количеству передаваемых данных видим, что с 0 до 15 часов трафик значительно ниже и это вероятнее всего нерабочие часы. Теперь найдём IP зараженного хоста.
+
+```{r}
+nw_time <- df %>% select(timestamp, src, bytes) %>% mutate(timestamp = hour(as_datetime(timestamp/1000))) %>% filter(src != '13.37.84.125' & timestamp >= 0 & timestamp <= 15) %>% group_by(src) %>% summarise(bytsum = sum(bytes)) %>% arrange(desc(bytsum)) %>% collect()
+
+nw_time %>% head(1)
+```
+
+Ответ: 12.55.77.96
+
+##Задание 3
+
+Еще один нарушитель собирает содержимое электронной почты и отправляет в Интернет используя порт, который обычно используется для другого типа трафика. Атакующий пересылает большое количество информации используя этот порт, которое нехарактерно для других хостов, использующих этот номер порта. Определите IP этой системы. Известно, что ее IP адрес отличается от нарушителей из предыдущих задач.
+
+Для начала сравним среднее и максимальное количество трафика каждого хоста по портам.
+
+```{r}
+sr_traf <- df %>% select(src, port, bytes) %>% group_by(src, port) %>% summarise(bytport_sum = sum(bytes)) %>% group_by(port) %>% summarise(sr_traf = mean(bytport_sum)) %>% arrange(desc(sr_traf))
+
+sr_traf %>% collect()
+
+max_traf <- df %>% select(src, port, bytes) %>% filter(src != '13.37.84.125' & src != '12.55.77.96') %>% group_by(src, port) %>% summarise(bytport_sum = sum(bytes)) %>% collect() %>% group_by(port) %>% top_n(1, bytport_sum) %>% arrange(desc(bytport_sum))
+
+max_traf %>% collect()
+
+#Теперь найдём разницу между средним и максимальным значением трафика по портам.
+
+merged_df <- merge(max_traf, sr_traf, by = 'port')
+
+bad_traf <- merged_df %>% mutate(bad_bytes = bytport_sum/sr_traf) %>% arrange(desc(bad_bytes)) %>% head(1)
+
+bad_traf %>% collect()
+```
+
+Ответ: 12.30.96.87
+
+## Задание 4
+
+Зачастую в корпоротивных сетях находятся ранее зараженные системы,
+компрометация которых осталась незамеченной. Такие системы генерируют
+небольшое количество трафика для связи с панелью управления бот-сети, но с
+одинаковыми параметрами – в данном случае с одинаковым номером порта.
+Какой номер порта используется бот-панелью для управления ботами?
+
+```{r}
+bad_port <- df %>% group_by(port) %>% summarise(bad_traf= mean(bytes)-min(bytes)) %>% arrange(bad_traf) %>% filter(bad_traf!=0) %>% select(port, bad_traf) %>% slice(1)
+
+bad_port |> collect()
+```
+Ответ: 124
+
+## Задание 5
+
+Иногда компрометация сети проявляется в нехарактерном трафике между хостами
+в локальной сети, который свидетельствует о горизонтальном перемещении (lateral
+movement).
+В нашей сети замечена система, которая ретранслирует по локальной сети
+полученные от панели управления бот-сети команды, создав таким образом
+внутреннюю пиринговую сеть.
+Какой уникальный порт используется этой бот сетью для внутреннего общения
+между собой?
+
+```{r}
+bad_port <- df %>% filter(str_detect(src, "^12.") | str_detect(src, "^13.") | str_detect(src, "^14."))  %>%
+  filter(str_detect(dst, "^12.") | str_detect(dst, "^13.") | str_detect(dst, "^14.")) %>%  group_by(port) %>% summarise(bad_traf = max(bytes) - min(bytes)) %>% arrange(desc(bad_traf)) %>% select(port) %>% slice(1)
+
+bad_port |> collect()
+```
+Ответ: 115
+
+## Задание 6
+
+Нашу сеть только что внесли в списки спам-ферм. Один из хостов сети получает
+множество команд от панели C&C, ретранслируя их внутри сети. В обычных
+условиях причин для такого активного взаимодействия внутри сети у данного хоста
+нет.
+Определите IP такого хоста.
+
+```{r}
+bad_port <- df %>%  filter(str_detect(src, "^12.") | str_detect(src, "^13.") | str_detect(src, "^14."))  %>%  filter(str_detect(dst, "^12.") | str_detect(dst, "^13.") | str_detect(dst, "^14."))  %>% group_by(src) %>% summarise(count = n()) %>% arrange(desc(count)) %>% slice(1)
+
+bad_port |> collect()
+```
+Ответ: 13.42.70.40
+
+## Вывод
+Научился пользоваться СУБД DuckDB для обработки и анализ больших данных совместно с языком программирования R.
